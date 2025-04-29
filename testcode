@@ -1,145 +1,167 @@
 #Test Script
 import os
-import sys
 import requests
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime
-import time
+from math import exp, sqrt, log
+from datetime import datetime, timedelta
 
-# === Option Pricing Models ===
-
-def black_scholes_price(S, K, T, r, sigma, q=0.0, option_type='call'):
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-
-    if option_type == 'call':
-        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    elif option_type == 'put':
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
-    else:
-        raise ValueError("option_type must be 'call' or 'put'")
-
-def binomial_tree_price(S, K, T, r, sigma, N=100, q=0.0, option_type='call', american=True):
-    dt = T / N
-    u = np.exp(sigma * np.sqrt(dt))
-    d = 1 / u
-    p = (np.exp((r - q) * dt) - d) / (u - d)
-    discount = np.exp(-r * dt)
-
-    ST = np.array([S * (u ** j) * (d ** (N - j)) for j in range(N + 1)])
-    if option_type == 'call':
-        option_values = np.maximum(ST - K, 0)
-    elif option_type == 'put':
-        option_values = np.maximum(K - ST, 0)
-    else:
-        raise ValueError("option_type must be 'call' or 'put'")
-
-    for i in range(N - 1, -1, -1):
-        option_values = discount * (p * option_values[1:i + 2] + (1 - p) * option_values[0:i + 1])
-        if american:
-            ST = np.array([S * (u ** j) * (d ** (i - j)) for j in range(i + 1)])
-            if option_type == 'call':
-                exercise = np.maximum(ST - K, 0)
-            else:
-                exercise = np.maximum(K - ST, 0)
-            option_values = np.maximum(option_values, exercise)
-
-    return option_values[0]
-
-# === Main App Logic ===
-
-class PolygonOptionPricer:
+class OptionPricer:
     def __init__(self):
         self.api_key = os.getenv("POLYGON_API_KEY", "lsDOciebOXjeRZQP3Gz_cX9YwboBi65n")
         self.base_url = "https://api.polygon.io"
-        self.risk_free_rate = 0.05
-        self.sigma = 0.3  # assumed constant volatility
-        self.div_yield = 0.0
-        self.max_retries = 2
-        self.retry_delay = 1
+        self.risk_free_rate = 0.05  # Default risk-free rate
+        self.dividend_yield = 0.0   # Default dividend yield
+        self.volatility = 0.3       # Will be calculated from max available data
 
-    def fetch_with_retry(self, url):
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = requests.get(url)
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                if attempt == self.max_retries:
-                    print(f"Fatal error after {self.max_retries + 1} attempts: {str(e)}")
-                    sys.exit(1)
-                wait_time = self.retry_delay * (2 ** attempt)
-                print(f"Attempt {attempt + 1} failed. Retrying in {wait_time:.1f} seconds...")
-                time.sleep(wait_time)
+    def fetch_data(self, endpoint):
+        url = f"{self.base_url}{endpoint}?apiKey={self.api_key}"
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            return None
 
     def get_current_price(self, ticker):
-        url = f"{self.base_url}/v2/aggs/ticker/{ticker}/prev?adjusted=true&apiKey={self.api_key}"
-        data = self.fetch_with_retry(url)
-        if 'results' not in data or not data['results']:
-            print("Failed to fetch valid price data.")
-            sys.exit(1)
-        return data['results'][0]['c']
+        data = self.fetch_data(f"/v2/aggs/ticker/{ticker}/prev")
+        if data and 'results' in data and data['results']:
+            return data['results'][0]['c']
+        print(f"Could not fetch price for {ticker}, using $100 as default")
+        return 100.0
+
+    def get_max_historical_volatility(self, ticker):
+        # Get maximum available history (2 years for free tier)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365*2)  # Max free tier history
+        
+        data = self.fetch_data(
+            f"/v2/aggs/ticker/{ticker}/range/1/day/"
+            f"{start_date.strftime('%Y-%m-%d')}/"
+            f"{end_date.strftime('%Y-%m-%d')}"
+        )
+        
+        if data and 'results' in data and len(data['results']) > 1:
+            closes = [r['c'] for r in data['results']]
+            actual_days = len(closes)
+            returns = np.diff(closes)/closes[:-1]
+            annualized_vol = np.std(returns) * sqrt(252)  # Annualize
+            print(f"Calculated volatility using {actual_days} trading days of data")
+            return annualized_vol
+        
+        print(f"Using default volatility: {self.volatility}")
+        return self.volatility
 
     def get_user_input(self):
-        print("\n" + "=" * 60)
-        print("Option Pricing Calculator (Black-Scholes & Binomial Tree)")
-        print("=" * 60)
-
+        print("\n" + "="*50)
+        print("Option Pricing Calculator")
+        print("="*50)
+        
         ticker = input("Enter stock ticker (e.g., AAPL): ").strip().upper()
         current_price = self.get_current_price(ticker)
-        print(f"\nCurrent {ticker} price (prev close): ${current_price:.2f}")
-
+        print(f"\nCurrent {ticker} price: ${current_price:.2f} (fetched from API)")
+        
         strike = float(input("Enter strike price: "))
-        exp_input = input("Enter expiration (days or YYYY-MM-DD): ").strip()
-        if "-" in exp_input:
-            exp_date = datetime.strptime(exp_input, "%Y-%m-%d")
-            days_to_exp = (exp_date - datetime.now()).days
-        else:
-            days_to_exp = int(exp_input)
-
-        T = days_to_exp / 365
-        option_type = input("Option Type (C for Call, P for Put): ").strip().upper()
-        if option_type not in ['C', 'P']:
-            print("Invalid option type")
-            sys.exit(1)
-
-        style = input("Option Style (A for American, E for European): ").strip().upper()
-        is_american = style == 'A'
-
+        exp_date = input("Enter expiration date (YYYY-MM-DD): ").strip()
+        expiration = datetime.strptime(exp_date, "%Y-%m-%d")
+        days_to_exp = (expiration - datetime.now()).days
+        
+        option_type = input("Call or Put? (C/P): ").strip().upper()[0]
+        exercise_style = input("American or European? (A/E): ").strip().upper()[0]
+        
+        # Calculate volatility using maximum available data
+        self.volatility = self.get_max_historical_volatility(ticker)
+        
         return {
             'ticker': ticker,
-            'S': current_price,
-            'K': strike,
-            'T': T,
-            'option_type': 'call' if option_type == 'C' else 'put',
-            'american': is_american
+            'current_price': current_price,
+            'strike': strike,
+            'days_to_exp': days_to_exp,
+            'type': 'call' if option_type == 'C' else 'put',
+            'exercise_style': 'american' if exercise_style == 'A' else 'european'
         }
+
+    def calculate_black_scholes(self, inputs):
+        T = inputs['days_to_exp']/365.0
+        S = inputs['current_price']
+        K = inputs['strike']
+        r = self.risk_free_rate
+        sigma = self.volatility
+        delta = self.dividend_yield
+
+        d1 = (log(S/K) + (r - delta + 0.5*sigma**2)*T)/(sigma*sqrt(T))
+        d2 = d1 - sigma*sqrt(T)
+
+        if inputs['type'] == 'call':
+            price = exp(-delta*T)*S*norm.cdf(d1) - exp(-r*T)*K*norm.cdf(d2)
+        else:
+            price = exp(-r*T)*K*norm.cdf(-d2) - exp(-delta*T)*S*norm.cdf(-d1)
+
+        print("\nBLACK-SCHOLES CALCULATION:")
+        print(f"Parameters: S={S:.2f}, K={K:.2f}, T={T:.2f} years")
+        print(f"σ={sigma:.4f}, r={r:.4f}, δ={delta:.4f}")
+        print(f"d1 = {d1:.6f}, d2 = {d2:.6f}")
+        return price
+
+    def calculate_binomial_tree(self, inputs, steps=100):
+        T = inputs['days_to_exp']/365.0
+        S = inputs['current_price']
+        K = inputs['strike']
+        r = self.risk_free_rate
+        sigma = self.volatility
+        delta = self.dividend_yield
+        dt = T/steps
+        u = exp(sigma*sqrt(dt))
+        d = 1/u
+        p = (exp((r-delta)*dt)-d)/(u-d)
+
+        # Initialize trees
+        price_tree = np.zeros((steps+1, steps+1))
+        option_tree = np.zeros((steps+1, steps+1))
+        price_tree[0,0] = S
+
+        # Build price tree
+        for i in range(1, steps+1):
+            price_tree[i,0] = price_tree[i-1,0]*u
+            for j in range(1, i+1):
+                price_tree[i,j] = price_tree[i-1,j-1]*d
+
+        # Terminal payoffs
+        for j in range(steps+1):
+            if inputs['type'] == 'call':
+                option_tree[steps,j] = max(0, price_tree[steps,j]-K)
+            else:
+                option_tree[steps,j] = max(0, K-price_tree[steps,j])
+
+        # Backward induction
+        for i in range(steps-1, -1, -1):
+            for j in range(i+1):
+                hold = exp(-r*dt)*(p*option_tree[i+1,j] + (1-p)*option_tree[i+1,j+1])
+                exercise = max(0, price_tree[i,j]-K) if inputs['type']=='call' else max(0,K-price_tree[i,j])
+                option_tree[i,j] = max(hold, exercise)
+
+        print("\nBINOMIAL TREE PARAMETERS:")
+        print(f"Steps: {steps}, u={u:.4f}, d={d:.4f}, p={p:.4f}")
+        return option_tree[0,0]
 
     def run(self):
         inputs = self.get_user_input()
-        S = inputs['S']
-        K = inputs['K']
-        T = inputs['T']
-        r = self.risk_free_rate
-        sigma = self.sigma
-        q = self.div_yield
-        option_type = inputs['option_type']
-        american = inputs['american']
+        
+        print("\n" + "="*50)
+        print(f"Pricing {inputs['ticker']} {inputs['type']} option")
+        print(f"Current: ${inputs['current_price']:.2f}, Strike: ${inputs['strike']:.2f}")
+        print(f"Expires in: {inputs['days_to_exp']} days")
+        print(f"Style: {inputs['exercise_style'].capitalize()}")
+        print("="*50)
 
-        bs_price = black_scholes_price(S, K, T, r, sigma, q, option_type)
-        bt_price = binomial_tree_price(S, K, T, r, sigma, 100, q, option_type, american)
-
-        print("\n--- Results ---")
-        print(f"Option Type     : {option_type.capitalize()}")
-        print(f"Pricing Style   : {'American' if american else 'European'}")
-        print(f"Time to Expiry  : {T*365:.0f} days")
-        print(f"Volatility Used : {sigma:.2f}")
-        print(f"Risk-Free Rate  : {r:.2f}")
-        print(f"Dividend Yield  : {q:.2f}")
-        print(f"\nBlack-Scholes (European only): ${bs_price:.2f}")
-        print(f"Binomial Tree ({'American' if american else 'European'}): ${bt_price:.2f}")
+        if inputs['exercise_style'] == 'european':
+            price = self.calculate_black_scholes(inputs)
+            print(f"\nEuropean {inputs['type']} Price: ${price:.2f}")
+        else:
+            price = self.calculate_binomial_tree(inputs)
+            print(f"\nAmerican {inputs['type']} Price: ${price:.2f}")
 
 if __name__ == "__main__":
-    app = PolygonOptionPricer()
-    app.run()
+    pricer = OptionPricer()
+    pricer.run()
