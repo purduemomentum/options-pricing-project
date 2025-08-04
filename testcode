@@ -1,5 +1,3 @@
-#Test Script
-import os
 import requests
 import numpy as np
 from scipy.stats import norm
@@ -8,16 +6,76 @@ from datetime import datetime, timedelta
 
 class OptionPricer:
     def __init__(self):
-        self.api_key = os.getenv("POLYGON_API_KEY", "lsDOciebOXjeRZQP3Gz_cX9YwboBi65n")
-        self.base_url = "https://api.polygon.io"
-        self.risk_free_rate = 0.05  # Default risk-free rate
-        self.dividend_yield = 0.0   # Default dividend yield
-        self.volatility = 0.3       # Will be calculated from max available data
+        # Hardcoded API keys (replace with your actual keys)
+        self.polygon_key = "lsDOciebOXjeRZQP3Gz_cX9YwboBi65n"  # Polygon.io key - replace ASAP - key not registered to Momentum.
+        self.fred_key = "bc3bcc9a953374e17078ae0b921f8f3d"  # FRED API key
+        
+        # Treasury yield series with realistic current rates
+        self.treasury_series = {
+            '3mo': {'id': 'DTB3', 'current': 0.0434},  # 3-month T-bill (4.34%)
+            '6mo': {'id': 'DTB6', 'current': 0.0426},  # 6-month T-bill (4.26%)
+            '1yr': {'id': 'DGS1', 'current': 0.0407}   # 1-year Treasury (4.07%)
+        }
+        
+        # Initialize with safe defaults
+        self.risk_free_rate = 0.05  # Will be updated
+        self.dividend_yield = 0.0
+        self.volatility = 0.3
+
+    def _get_treasury_series_for_maturity(self, days_to_exp):
+        """Selects appropriate Treasury series based on option maturity"""
+        if days_to_exp <= 90:
+            return '3mo'
+        elif days_to_exp <= 180:
+            return '6mo'
+        else:
+            return '1yr'  # For all maturities beyond 6 months up to 1 year
+
+    def _fetch_risk_free_rate(self, days_to_exp):
+        """Fetches Treasury yield from FRED with realistic validation"""
+        series_key = self._get_treasury_series_for_maturity(days_to_exp)
+        series = self.treasury_series[series_key]
+        endpoint = f"https://api.stlouisfed.org/fred/series/observations?series_id={series['id']}&api_key={self.fred_key}&file_type=json&limit=1"
+        
+        try:
+            response = requests.get(endpoint, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'observations' in data and data['observations']:
+                rate_pct = float(data["observations"][-1]["value"])
+                rate = rate_pct / 100  # Convert to decimal
+                
+                # Validate rate is within ±1% of current market rate
+                if abs(rate - series['current']) <= 0.01:
+                    return rate
+                print(f"Warning: Treasury yield {rate_pct:.2f}% differs from expected {series['current']*100:.2f}%")
+                
+        except Exception as e:
+            print(f"Failed to fetch Treasury yield: {e}")
+        
+        # Fallback to current market rate if API fails or data is invalid
+        return series['current']
+
+    def _fetch_dividend_yield(self, ticker):
+        """Fetches current dividend yield from Polygon API"""
+        endpoint = f"https://api.polygon.io/v3/reference/dividends?ticker={ticker}&apiKey={self.polygon_key}"
+        try:
+            response = requests.get(endpoint, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            if data.get('results'):
+                div_amount = data['results'][0]['cash_amount']
+                stock_price = self.get_current_price(ticker)
+                return div_amount / stock_price  # Dividend yield
+        except Exception as e:
+            print(f"Failed to fetch dividend yield: {e}")
+        return 0.0
 
     def fetch_data(self, endpoint):
-        url = f"{self.base_url}{endpoint}?apiKey={self.api_key}"
+        url = f"https://api.polygon.io{endpoint}?apiKey={self.polygon_key}"
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=5)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -25,16 +83,18 @@ class OptionPricer:
             return None
 
     def get_current_price(self, ticker):
-        data = self.fetch_data(f"/v2/aggs/ticker/{ticker}/prev")
-        if data and 'results' in data and data['results']:
-            return data['results'][0]['c']
-        print(f"Could not fetch price for {ticker}, using $100 as default")
-        return 100.0
+        max_retries = 3
+        for attempt in range(max_retries):
+            data = self.fetch_data(f"/v2/aggs/ticker/{ticker}/prev")
+            if data and data.get('results'):
+                return data['results'][0]['c']
+            print(f"Error: Could not fetch price for {ticker} (attempt {attempt + 1}/{max_retries})")
+        
+        raise ValueError(f"Failed to fetch price for {ticker} after {max_retries} attempts. Please check the ticker symbol and try again.")
 
     def get_max_historical_volatility(self, ticker):
-        # Get maximum available history (2 years for free tier)
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=365*2)  # Max free tier history
+        start_date = end_date - timedelta(days=365*2)
         
         data = self.fetch_data(
             f"/v2/aggs/ticker/{ticker}/range/1/day/"
@@ -42,11 +102,11 @@ class OptionPricer:
             f"{end_date.strftime('%Y-%m-%d')}"
         )
         
-        if data and 'results' in data and len(data['results']) > 1:
+        if data and data.get('results') and len(data['results']) > 1:
             closes = [r['c'] for r in data['results']]
             actual_days = len(closes)
             returns = np.diff(closes)/closes[:-1]
-            annualized_vol = np.std(returns) * sqrt(252)  # Annualize
+            annualized_vol = np.std(returns) * sqrt(252)
             print(f"Calculated volatility using {actual_days} trading days of data")
             return annualized_vol
         
@@ -58,20 +118,55 @@ class OptionPricer:
         print("Option Pricing Calculator")
         print("="*50)
         
-        ticker = input("Enter stock ticker (e.g., AAPL): ").strip().upper()
-        current_price = self.get_current_price(ticker)
-        print(f"\nCurrent {ticker} price: ${current_price:.2f} (fetched from API)")
+        while True:
+            ticker = input("Enter stock ticker (e.g., AAPL): ").strip().upper()
+            if ticker and all(c.isalpha() for c in ticker):
+                try:
+                    current_price = self.get_current_price(ticker)
+                    break
+                except ValueError as e:
+                    print(e)
+                    continue
+            print("Error: Ticker must contain only letters (e.g., AAPL)")
         
-        strike = float(input("Enter strike price: "))
-        exp_date = input("Enter expiration date (YYYY-MM-DD): ").strip()
-        expiration = datetime.strptime(exp_date, "%Y-%m-%d")
+        self.dividend_yield = self._fetch_dividend_yield(ticker)
+        print(f"\nCurrent {ticker} price: ${current_price:.2f}")
+        print(f"Current dividend yield: {self.dividend_yield*100:.2f}%")
+        
+        while True:
+            try:
+                strike = float(input("Enter strike price: "))
+                if strike > 0:
+                    break
+                print("Error: Strike price must be positive")
+            except ValueError:
+                print("Error: Please enter a valid number")
+        
+        while True:
+            exp_date = input("Enter expiration date (YYYY-MM-DD): ").strip()
+            try:
+                expiration = datetime.strptime(exp_date, "%Y-%m-%d")
+                if expiration > datetime.now():
+                    break
+                print("Error: Expiration date must be in the future")
+            except ValueError:
+                print("Error: Invalid date format. Use YYYY-MM-DD")
+        
         days_to_exp = (expiration - datetime.now()).days
-        
-        option_type = input("Call or Put? (C/P): ").strip().upper()[0]
-        exercise_style = input("American or European? (A/E): ").strip().upper()[0]
-        
-        # Calculate volatility using maximum available data
+        self.risk_free_rate = self._fetch_risk_free_rate(days_to_exp)
         self.volatility = self.get_max_historical_volatility(ticker)
+        
+        while True:
+            option_type = input("Call or Put? (C/P): ").strip().upper()
+            if option_type in ('C', 'P'):
+                break
+            print("Error: Please enter C for Call or P for Put")
+        
+        while True:
+            exercise_style = input("American or European? (A/E): ").strip().upper()
+            if exercise_style in ('A', 'E'):
+                break
+            print("Error: Please enter A for American or E for European")
         
         return {
             'ticker': ticker,
@@ -83,6 +178,7 @@ class OptionPricer:
         }
 
     def calculate_black_scholes(self, inputs):
+        """European option pricing with dividend yield"""
         T = inputs['days_to_exp']/365.0
         S = inputs['current_price']
         K = inputs['strike']
@@ -98,13 +194,55 @@ class OptionPricer:
         else:
             price = exp(-r*T)*K*norm.cdf(-d2) - exp(-delta*T)*S*norm.cdf(-d1)
 
-        print("\nBLACK-SCHOLES CALCULATION:")
-        print(f"Parameters: S={S:.2f}, K={K:.2f}, T={T:.2f} years")
-        print(f"σ={sigma:.4f}, r={r:.4f}, δ={delta:.4f}")
-        print(f"d1 = {d1:.6f}, d2 = {d2:.6f}")
-        return price
+        return price, d1, d2
 
-    def calculate_binomial_tree(self, inputs, steps=100):
+    def calculate_black_scholes_greeks(self, inputs, d1, d2):
+        """Calculate all Greeks for Black-Scholes model"""
+        T = inputs['days_to_exp']/365.0
+        S = inputs['current_price']
+        K = inputs['strike']
+        r = self.risk_free_rate
+        sigma = self.volatility
+        delta_div = self.dividend_yield
+
+        # Delta
+        if inputs['type'] == 'call':
+            delta = exp(-delta_div*T)*norm.cdf(d1)
+        else:
+            delta = -exp(-delta_div*T)*norm.cdf(-d1)
+        
+        # Gamma (same for calls/puts)
+        gamma = exp(-delta_div*T)*norm.pdf(d1)/(S*sigma*sqrt(T))
+        
+        # Theta (per day)
+        if inputs['type'] == 'call':
+            theta = (-(S*sigma*exp(-delta_div*T)*norm.pdf(d1))/(2*sqrt(T)) 
+                    - r*K*exp(-r*T)*norm.cdf(d2)
+                    + delta_div*S*exp(-delta_div*T)*norm.cdf(d1))/365
+        else:
+            theta = (-(S*sigma*exp(-delta_div*T)*norm.pdf(d1))/(2*sqrt(T)) 
+                    + r*K*exp(-r*T)*norm.cdf(-d2)
+                    - delta_div*S*exp(-delta_div*T)*norm.cdf(-d1))/365
+        
+        # Vega (per 1% change in vol)
+        vega = S*exp(-delta_div*T)*norm.pdf(d1)*sqrt(T)/100
+        
+        # Rho (per 1% change in rates)
+        if inputs['type'] == 'call':
+            rho = K*T*exp(-r*T)*norm.cdf(d2)/100
+        else:
+            rho = -K*T*exp(-r*T)*norm.cdf(-d2)/100
+        
+        return {
+            'Delta': delta,
+            'Gamma': gamma,
+            'Theta': theta,
+            'Vega': vega,
+            'Rho': rho
+        }
+
+    def calculate_binomial_tree(self, inputs, steps=500):
+        """American option pricing with dividend yield"""
         T = inputs['days_to_exp']/365.0
         S = inputs['current_price']
         K = inputs['strike']
@@ -116,7 +254,7 @@ class OptionPricer:
         d = 1/u
         p = (exp((r-delta)*dt)-d)/(u-d)
 
-        # Initialize trees
+        # Tree initialization
         price_tree = np.zeros((steps+1, steps+1))
         option_tree = np.zeros((steps+1, steps+1))
         price_tree[0,0] = S
@@ -134,33 +272,126 @@ class OptionPricer:
             else:
                 option_tree[steps,j] = max(0, K-price_tree[steps,j])
 
-        # Backward induction
+        # Backward induction with early exercise
         for i in range(steps-1, -1, -1):
             for j in range(i+1):
                 hold = exp(-r*dt)*(p*option_tree[i+1,j] + (1-p)*option_tree[i+1,j+1])
                 exercise = max(0, price_tree[i,j]-K) if inputs['type']=='call' else max(0,K-price_tree[i,j])
                 option_tree[i,j] = max(hold, exercise)
 
-        print("\nBINOMIAL TREE PARAMETERS:")
-        print(f"Steps: {steps}, u={u:.4f}, d={d:.4f}, p={p:.4f}")
         return option_tree[0,0]
 
+    def calculate_binomial_greeks(self, inputs, steps=500):
+        """Calculate all Greeks for Binomial model using finite differences"""
+        # Save original parameters
+        S_orig = inputs['current_price']
+        T_orig = inputs['days_to_exp']
+        vol_orig = self.volatility
+        rate_orig = self.risk_free_rate
+        
+        # Base price calculation
+        base_price = self.calculate_binomial_tree(inputs, steps)
+        
+        # Delta - bump price by 1%
+        inputs['current_price'] = S_orig * 1.01
+        price_up = self.calculate_binomial_tree(inputs, steps)
+        inputs['current_price'] = S_orig * 0.99
+        price_down = self.calculate_binomial_tree(inputs, steps)
+        delta = (price_up - price_down)/(0.02*S_orig)
+        
+        # Gamma - from delta changes
+        inputs['current_price'] = S_orig * 1.01
+        delta_up = (self.calculate_binomial_tree(inputs, steps) - base_price)/(0.01*S_orig)
+        inputs['current_price'] = S_orig * 0.99
+        delta_down = (base_price - self.calculate_binomial_tree(inputs, steps))/(0.01*S_orig)
+        gamma = (delta_up - delta_down)/(0.02*S_orig)
+        
+        # Theta - move time forward 1 day
+        inputs['current_price'] = S_orig
+        inputs['days_to_exp'] = max(1, T_orig - 1)
+        price_time = self.calculate_binomial_tree(inputs, steps)
+        theta = (price_time - base_price)  # per day
+        
+        # Vega - bump vol by 1%
+        self.volatility = vol_orig + 0.01
+        price_vol_up = self.calculate_binomial_tree(inputs, steps)
+        vega = (price_vol_up - base_price)  # per 1% vol change
+        
+        # Rho - bump rates by 1%
+        self.volatility = vol_orig  # Reset vol
+        inputs['days_to_exp'] = T_orig  # Reset time
+        self.risk_free_rate = rate_orig + 0.01
+        price_rate_up = self.calculate_binomial_tree(inputs, steps)
+        rho = (price_rate_up - base_price)  # per 1% rate change
+        
+        # Reset all parameters
+        inputs['current_price'] = S_orig
+        inputs['days_to_exp'] = T_orig
+        self.volatility = vol_orig
+        self.risk_free_rate = rate_orig
+        
+        return {
+            'Delta': delta,
+            'Gamma': gamma,
+            'Theta': theta,
+            'Vega': vega,
+            'Rho': rho
+        }
+
+    def display_results(self, inputs, price, greeks):
+        """Display pricing results and Greeks in a formatted table"""
+        print("\n" + "="*50)
+        print(f"{inputs['exercise_style'].capitalize()} {inputs['type'].capitalize()} Option Results")
+        print("="*50)
+        print(f"{'Option Price:':<20} ${price:.2f}")
+        print("\nGreeks:")
+        print(f"{'Delta:':<20} {greeks['Delta']:.4f}")
+        print(f"{'Gamma:':<20} {greeks['Gamma']:.4f}")
+        print(f"{'Theta:':<20} {greeks['Theta']:.4f}")
+        print(f"{'Vega:':<20} {greeks['Vega']:.4f}")
+        print(f"{'Rho:':<20} {greeks['Rho']:.4f}")
+        print("="*50)
+
     def run(self):
-        inputs = self.get_user_input()
+        while True:
+            try:
+                inputs = self.get_user_input()
+                break
+            except Exception as e:
+                print(f"\nError: {e}")
+                print("Please try again with valid inputs.\n")
+                continue
+        
+        # Print market data
+        series_key = self._get_treasury_series_for_maturity(inputs['days_to_exp'])
+        treasury_desc = {
+            '3mo': "3-month Treasury bill",
+            '6mo': "6-month Treasury bill", 
+            '1yr': "1-year Treasury"
+        }.get(series_key, "Treasury")
         
         print("\n" + "="*50)
-        print(f"Pricing {inputs['ticker']} {inputs['type']} option")
-        print(f"Current: ${inputs['current_price']:.2f}, Strike: ${inputs['strike']:.2f}")
-        print(f"Expires in: {inputs['days_to_exp']} days")
-        print(f"Style: {inputs['exercise_style'].capitalize()}")
+        print(f"Pricing {inputs['ticker']} {inputs['type'].upper()} option") 
+        print("="*50)
+        print(f"{'Current Price:':<20} ${inputs['current_price']:.2f}")
+        print(f"{'Strike Price:':<20} ${inputs['strike']:.2f}")
+        print(f"{'Expiration:':<20} {inputs['days_to_exp']} days")
+        print(f"{'Risk-Free Rate:':<20} {self.risk_free_rate*100:.2f}% ({treasury_desc})")
+        print(f"{'Dividend Yield:':<20} {self.dividend_yield*100:.2f}%")
+        print(f"{'Volatility:':<20} {self.volatility*100:.2f}%")
+        print(f"{'Style:':<20} {inputs['exercise_style'].capitalize()}")
         print("="*50)
 
         if inputs['exercise_style'] == 'european':
-            price = self.calculate_black_scholes(inputs)
-            print(f"\nEuropean {inputs['type']} Price: ${price:.2f}")
+            # Black-Scholes calculation
+            price, d1, d2 = self.calculate_black_scholes(inputs)
+            greeks = self.calculate_black_scholes_greeks(inputs, d1, d2)
         else:
+            # Binomial Tree calculation
             price = self.calculate_binomial_tree(inputs)
-            print(f"\nAmerican {inputs['type']} Price: ${price:.2f}")
+            greeks = self.calculate_binomial_greeks(inputs)
+        
+        self.display_results(inputs, price, greeks)
 
 if __name__ == "__main__":
     pricer = OptionPricer()
